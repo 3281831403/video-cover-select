@@ -10,13 +10,11 @@ The module deliberately contains no I/O and no third-party dependencies.
 Invalid input (malformed frame, bad target, bad box, unknown weights, empty
 candidate list, and so on) must raise :class:`CoverError`, which is the only
 exception type callers need to handle.
-
-All eight public functions are stubs in this initial repository.  Their
-docstrings define the contract that a fix must implement.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -56,27 +54,157 @@ DEFAULT_WEIGHTS = {
 #: Weight applied to pixels inside the face-proxy box, before normalisation.
 FACE_CENTER_WEIGHT = 1.5
 
+#: Tolerance used when treating two scores as a tie.
+_TOL = 1e-6
+
+_WEIGHT_KEYS = ("sharpness", "brightness", "contrast", "face", "composition")
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_real_number(value: Any) -> bool:
+    """Return whether ``value`` is a real, finite, non-boolean number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value))
+
+
+def _validate_frame(frame: Any) -> list[list[float]]:
+    """Validate ``frame`` and return a plain float copy of it.
+
+    A valid frame is a non-empty rectangular two-dimensional sequence whose
+    finite, non-boolean numeric values all lie in ``[0.0, 1.0]``.
+    """
+    if isinstance(frame, (str, bytes, Mapping)) or not isinstance(
+        frame, Sequence
+    ):
+        raise CoverError("frame must be a non-empty 2D sequence")
+
+    rows = len(frame)
+    if rows == 0:
+        raise CoverError("frame must have at least one row")
+
+    width: int | None = None
+    validated: list[list[float]] = []
+    for row in frame:
+        if isinstance(row, (str, bytes, Mapping)) or not isinstance(
+            row, Sequence
+        ):
+            raise CoverError("every frame row must be a sequence")
+        if width is None:
+            width = len(row)
+            if width == 0:
+                raise CoverError("frame must have at least one column")
+        elif len(row) != width:
+            raise CoverError("frame rows must all have the same length")
+
+        validated_row: list[float] = []
+        for value in row:
+            if not _is_real_number(value):
+                raise CoverError(
+                    "frame values must be finite numbers in [0.0, 1.0]"
+                )
+            number = float(value)
+            if number < 0.0 or number > 1.0:
+                raise CoverError(
+                    "frame values must lie in [0.0, 1.0]"
+                )
+            validated_row.append(number)
+        validated.append(validated_row)
+
+    return validated
+
+
+def _validate_weights(weights: Any) -> dict[str, float]:
+    """Validate and normalise a weight mapping.
+
+    Missing keys count as zero, unknown keys or non-finite/negative values
+    raise :class:`CoverError`, and an all-zero mapping is rejected so callers
+    never divide by zero.
+    """
+    if not isinstance(weights, Mapping):
+        raise CoverError("weights must be a mapping")
+
+    validated: dict[str, float] = {}
+    total = 0.0
+    for key in _WEIGHT_KEYS:
+        if key not in weights:
+            validated[key] = 0.0
+            continue
+        value = weights[key]
+        if not _is_real_number(value):
+            raise CoverError(f"weight {key!r} must be a finite number")
+        number = float(value)
+        if number < 0.0:
+            raise CoverError(f"weight {key!r} must be non-negative")
+        validated[key] = number
+        total += number
+
+    if len(weights) != len(_WEIGHT_KEYS):
+        for key in weights:
+            if key not in validated:
+                raise CoverError(f"unknown weight key: {key!r}")
+
+    if total <= 0.0:
+        raise CoverError("weights must have a strictly positive sum")
+
+    return validated
+
+
+def _clamp_unit(value: float) -> float:
+    """Clamp tiny floating-point excursions back into ``[0.0, 1.0]``."""
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return float(value)
+
+
+# ---------------------------------------------------------------------------
+# Component scores
+# ---------------------------------------------------------------------------
+
 
 def sharpness(frame: Sequence[Sequence[float]]) -> float:
     """Return a normalized Laplacian-variance sharpness score for ``frame``.
 
-    Contract
-    --------
-    * ``frame`` is a non-empty rectangular grayscale frame with values in
-      ``[0.0, 1.0]``; otherwise raise :class:`CoverError`.
-    * Compute the four-neighbour discrete Laplacian of the frame, then the
-      population variance of those Laplacian responses.  Normalize that
-      variance to ``[0.0, 1.0]`` and return it; a constant frame must score
-      exactly ``0.0`` and a frame with strong checkerboard-like detail must
-      score much higher than a blurred/constant frame.
-    * The score is a float in ``[0.0, 1.0]``.  A frame's mean brightness alone
-      must not determine this score: two frames with the same mean but
-      different detail must not automatically receive the same value.
-
-    The score is a measure of focus only; it does not consider faces,
-    composition, or exposure.
+    The four-neighbour discrete Laplacian measures local detail rather than
+    mean brightness.  Each interior response lies in ``[-4, 4]`` because the
+    input values are in ``[0, 1]``, so the population variance of the responses
+    is bounded by ``16``; dividing by ``16`` therefore normalizes the score to
+    ``[0.0, 1.0]``.  A constant frame has zero variance and scores exactly
+    ``0.0``.
     """
-    raise NotImplementedError
+    grid = _validate_frame(frame)
+    rows = len(grid)
+    cols = len(grid[0])
+
+    # Frames without a 2x2 interior cannot carry a four-neighbour interior.
+    if rows < 3 or cols < 3:
+        return 0.0
+
+    responses: list[float] = []
+    for i in range(1, rows - 1):
+        upper = grid[i - 1]
+        current = grid[i]
+        lower = grid[i + 1]
+        for j in range(1, cols - 1):
+            laplacian = (
+                upper[j]
+                + lower[j]
+                + current[j - 1]
+                + current[j + 1]
+                - 4.0 * current[j]
+            )
+            responses.append(laplacian)
+
+    count = len(responses)
+    mean = sum(responses) / count
+    variance = sum((value - mean) ** 2 for value in responses) / count
+    return _clamp_unit(variance / 16.0)
 
 
 def brightness_score(
@@ -84,46 +212,46 @@ def brightness_score(
 ) -> float:
     """Return how close ``frame``'s mean brightness is to ``target``.
 
-    Contract
-    --------
-    * ``frame`` must be a valid grayscale frame and ``target`` must be a finite
-      number in ``[0.0, 1.0]``; otherwise raise :class:`CoverError`.
-    * Let ``mean`` be the arithmetic mean of all frame values.  The score is::
-
-          1.0 - abs(mean - target) / max(target, 1.0 - target)
-
-      so it is exactly ``1.0`` when ``mean == target`` and falls linearly to
-      ``0.0`` at the farthest brightness endpoint.  Clamp tiny floating-point
-      excursions so the returned value is always in ``[0.0, 1.0]``.
-    * The result is a float in ``[0.0, 1.0]``.  Raw absolute differences (or
-      differences multiplied by a constant) are not a valid score.
-
-    ``target`` is supplied by the caller, allowing different videos or scenes
-    to request a darker or brighter cover.
+    The absolute error is divided by the distance from ``target`` to the
+    farthest brightness endpoint, which keeps the score inside ``[0.0, 1.0]``
+    and makes ``mean == target`` score exactly ``1.0``.
     """
-    raise NotImplementedError
+    grid = _validate_frame(frame)
+    if not _is_real_number(target):
+        raise CoverError("brightness target must be a finite number")
+    target_value = float(target)
+    if target_value < 0.0 or target_value > 1.0:
+        raise CoverError("brightness target must lie in [0.0, 1.0]")
+
+    pixel_count = len(grid) * len(grid[0])
+    total = sum(sum(row) for row in grid)
+    mean = total / pixel_count
+
+    denominator = max(target_value, 1.0 - target_value)
+    score = 1.0 - abs(mean - target_value) / denominator
+    return _clamp_unit(score)
 
 
 def contrast_score(frame: Sequence[Sequence[float]]) -> float:
     """Return a normalized dynamic-range contrast score for ``frame``.
 
-    Contract
-    --------
-    * ``frame`` must be a valid grayscale frame; otherwise raise
-      :class:`CoverError`.
-    * Compute ``span = max(frame) - min(frame)``, where the full grayscale
-      scale is ``1.0`` (equivalent to an 8-bit range of ``255`` divided by
-      ``255``).  Return ``span`` directly, clamped to ``[0.0, 1.0]``.
-    * A constant frame therefore scores ``0.0`` and a frame containing both
-      ``0.0`` and ``1.0`` scores ``1.0``.  Do not multiply by 255 or another
-      scale factor: the returned score is unitless and must stay in
-      ``[0.0, 1.0]``.  A low-range dark frame must not outrank a frame that
-      actually uses the full range.
-
-    This is a whole-frame measure and is independent of the mean brightness
-    target handled by :func:`brightness_score`.
+    The frame already uses the unit grayscale scale (an 8-bit value divided by
+    255), so ``max - min`` is itself the normalized span and must never be
+    multiplied by 255 again.
     """
-    raise NotImplementedError
+    grid = _validate_frame(frame)
+
+    minimum = math.inf
+    maximum = -math.inf
+    for row in grid:
+        row_min = min(row)
+        row_max = max(row)
+        if row_min < minimum:
+            minimum = row_min
+        if row_max > maximum:
+            maximum = row_max
+
+    return _clamp_unit(maximum - minimum)
 
 
 def face_proxy(
@@ -132,55 +260,127 @@ def face_proxy(
 ) -> float:
     """Return a normalized center-weighting proxy for a suspected face.
 
-    ``box`` uses normalized coordinates ``(left, top, right, bottom)`` with
-    ``0.0 <= left < right <= 1.0`` and ``0.0 <= top < bottom <= 1.0``.  Pixel
-    centers whose normalized coordinates fall inside the half-open rectangle
-    ``[left, right) x [top, bottom)`` receive weight
-    :data:`FACE_CENTER_WEIGHT` (``1.5``); all other pixels receive weight
-    ``1.0``.
-
-    Contract
-    --------
-    * Validate the frame and box, including a non-empty selected region;
-      otherwise raise :class:`CoverError`.
-    * Return the weighted average of the frame values::
-
-          sum(value * weight) / sum(weight)
-
-      with the weights above.  The division by the total weight is required,
-      so an all-``1.0`` frame scores exactly ``1.0`` (never ``1.5`` or more).
-    * The result is a float in ``[0.0, 1.0]``.  For a center-bright frame the
-      weighted result must be greater than the unweighted whole-frame mean,
-      because the selected region is emphasized.
-
-    This function is only a proxy for a detected face; no face detection is
-    performed.
+    Pixels inside ``box`` receive :data:`FACE_CENTER_WEIGHT`; every other
+    pixel receives ``1.0``.  The weighted sum is divided by the total weight,
+    so an all-``1.0`` frame still scores exactly ``1.0``.
     """
-    raise NotImplementedError
+    grid = _validate_frame(frame)
+
+    if isinstance(box, (str, bytes, Mapping)) or not isinstance(
+        box, Sequence
+    ) or len(box) != 4:
+        raise CoverError("box must be a sequence of four coordinates")
+    coordinates = tuple(box)
+    if not all(_is_real_number(value) for value in coordinates):
+        raise CoverError("box coordinates must be finite numbers")
+    left, top, right, bottom = (float(value) for value in coordinates)
+
+    if not (0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0):
+        raise CoverError(
+            "box must satisfy 0 <= left < right <= 1 and "
+            "0 <= top < bottom <= 1"
+        )
+
+    rows = len(grid)
+    cols = len(grid[0])
+    weighted_sum = 0.0
+    total_weight = 0.0
+    selected = 0
+    for i, row in enumerate(grid):
+        # Pixel centers use normalized coordinates (i + 0.5) / dimension.
+        y = (i + 0.5) / rows
+        in_vertical_band = top <= y < bottom
+        for j, value in enumerate(row):
+            x = (j + 0.5) / cols
+            if in_vertical_band and left <= x < right:
+                weight = FACE_CENTER_WEIGHT
+                selected += 1
+            else:
+                weight = 1.0
+            weighted_sum += value * weight
+            total_weight += weight
+
+    if selected == 0:
+        raise CoverError("box must select at least one pixel center")
+
+    return _clamp_unit(weighted_sum / total_weight)
+
+
+def _line_weight(position: float) -> float:
+    """Weight edge energy at ``position`` according to the rule of thirds.
+
+    The weight follows the normalized distance from the frame center, so it
+    is continuous and independent of the frame's pixel resolution.  Energy at
+    the frame center contributes the neutral weight ``1.0``; the two third
+    lines lie at half the maximum distance and receive the peak weight
+    ``2.0``; beyond them the weight eases off to ``0.5`` at the frame borders
+    (energy located on a third line is still weighted four times as strongly
+    as energy at the center).
+    """
+    normalized_distance = abs(position - 0.5) / (1.0 / 6.0)
+    if normalized_distance <= 1.0:
+        # Center -> third line: 1.0 up to the peak of 2.0.
+        return 1.0 + normalized_distance
+    # Third line -> border: 2.0 easing back down to 0.5.
+    return 2.0 - 1.5 * (normalized_distance - 1.0)
 
 
 def composition(frame: Sequence[Sequence[float]]) -> float:
     """Return a normalized rule-of-thirds composition score for ``frame``.
 
-    Contract
-    --------
-    * ``frame`` must be a valid grayscale frame; otherwise raise
-      :class:`CoverError`.
-    * Estimate horizontal and vertical edge energy (for example with forward
-      differences).  Edge energy located on either of the two vertical third
-      lines (``x = 1/3`` and ``x = 2/3``) and either of the two horizontal
-      third lines (``y = 1/3`` and ``y = 2/3``) contributes strongly; energy
-      near the frame center contributes little.
-    * Normalize the weighted edge energy by the total edge energy so the
-      result is a float in ``[0.0, 1.0]``.  Return ``0.0`` when the frame has
-      no edge energy (for example an all-black or constant frame).
-    * Both orientations matter.  A vertical edge placed on a vertical third
-      must score strictly higher than the same vertical edge moved to the
-      horizontal/vertical center; ignoring vertical third lines is a bug.
-
-    The result does not incorporate sharpness, exposure, or faces directly.
+    Both forward-difference orientations are scored: horizontal differences
+    (vertical edges) are rewarded on the *vertical* third lines and vertical
+    differences (horizontal edges) on the *horizontal* third lines.  The
+    weighted energy is divided by the total energy and then by the peak line
+    weight (``2.0``), so the result stays in ``[0.0, 1.0]`` and an edge-free
+    frame scores ``0.0``.
     """
-    raise NotImplementedError
+    grid = _validate_frame(frame)
+    rows = len(grid)
+    cols = len(grid[0])
+
+    total_energy = 0.0
+    weighted_energy = 0.0
+
+    # Horizontal forward differences: vertical edge energy, weighted by the
+    # vertical third lines x = 1/3 and x = 2/3.
+    if cols >= 2:
+        for i in range(rows):
+            row = grid[i]
+            for j in range(cols - 1):
+                energy = abs(row[j + 1] - row[j])
+                if energy <= 0.0:
+                    continue
+                position = (j + 1.0) / cols
+                total_energy += energy
+                weighted_energy += energy * _line_weight(position)
+
+    # Vertical forward differences: horizontal edge energy, weighted by the
+    # horizontal third lines y = 1/3 and y = 2/3.
+    if rows >= 2:
+        for i in range(rows - 1):
+            upper = grid[i]
+            lower = grid[i + 1]
+            for j in range(cols):
+                energy = abs(lower[j] - upper[j])
+                if energy <= 0.0:
+                    continue
+                position = (i + 1.0) / rows
+                total_energy += energy
+                weighted_energy += energy * _line_weight(position)
+
+    if total_energy <= 0.0:
+        return 0.0
+
+    # The peak line weight is 2.0, so weighted_energy / total_energy lies in
+    # [0.5, 2.0]; dividing by the peak maps the score onto [0.25, 1.0] while
+    # keeping the relative ordering between frames.
+    return _clamp_unit(weighted_energy / total_energy / 2.0)
+
+
+# ---------------------------------------------------------------------------
+# Aggregation and selection
+# ---------------------------------------------------------------------------
 
 
 def total_score(
@@ -189,92 +389,116 @@ def total_score(
 ) -> float:
     """Return the normalized weighted total score for ``frame``.
 
-    Recognized weight keys are ``"sharpness"``, ``"brightness"``,
-    ``"contrast"``, ``"face"``, and ``"composition"``.  Missing keys count as
-    ``0.0``; unknown keys or non-finite/negative values raise
-    :class:`CoverError`.  The weights must have a strictly positive sum.
-
-    Contract
-    --------
-    * Validate the frame and ``weights``; raise :class:`CoverError` for invalid
-      input.  In particular, all-zero weights must raise :class:`CoverError`
-      rather than divide by zero.
-    * Compute each component with the corresponding public function:
-      :func:`sharpness`, :func:`brightness_score` with
-      :data:`DEFAULT_BRIGHTNESS_TARGET` (``0.5``), :func:`contrast_score`,
-      :func:`face_proxy` with a central box of ``(0.25, 0.25, 0.75, 0.75)``,
-      and :func:`composition`.
-    * Return ``sum(weight_i * score_i) / sum(weight_i)`` (with missing weights
-      treated as zero), so the result is a float in ``[0.0, 1.0]`` for any
-      non-negative weights, normalized or not.
-    * Scaling every weight by the same positive constant must not change the
-      score.  For an all-black frame every component is zero, so the total
-      must be exactly ``0.0``.
-
-    This is the value used to rank cover candidates.
+    Every weight is non-negative and the weighted sum is divided by the total
+    weight, so unnormalized weights cannot overflow the ``[0.0, 1.0]`` range
+    and scaling all weights by a common factor leaves the score unchanged.
     """
-    raise NotImplementedError
+    grid = _validate_frame(frame)
+    validated_weights = _validate_weights(weights)
+
+    components = {
+        "sharpness": sharpness(grid),
+        "brightness": brightness_score(grid, DEFAULT_BRIGHTNESS_TARGET),
+        "contrast": contrast_score(grid),
+        "face": face_proxy(grid, (0.25, 0.25, 0.75, 0.75)),
+        "composition": composition(grid),
+    }
+
+    weight_sum = sum(validated_weights.values())
+    weighted_sum = sum(
+        validated_weights[key] * components[key] for key in _WEIGHT_KEYS
+    )
+    return _clamp_unit(weighted_sum / weight_sum)
+
+
+def _validate_candidates(candidates: Any) -> Sequence[Mapping[str, Any]]:
+    """Validate the common candidate sequence shape."""
+    if isinstance(candidates, (str, bytes, Mapping)) or not isinstance(
+        candidates, Sequence
+    ):
+        raise CoverError("candidates must be a non-empty sequence")
+    if len(candidates) == 0:
+        raise CoverError("candidate list must not be empty")
+
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            raise CoverError("each candidate must be a mapping")
+        if "idx" not in candidate or "frame" not in candidate:
+            raise CoverError(
+                "each candidate needs an 'idx' and a 'frame'"
+            )
+        idx = candidate["idx"]
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            raise CoverError("candidate 'idx' must be an integer")
+        # Reject malformed frames eagerly, including inside batch validation.
+        _validate_frame(candidate["frame"])
+
+    return candidates
+
+
+def _select(candidates: Any, weights: Mapping[str, float]) -> int:
+    """Pick the highest-scoring candidate, keeping the earliest one on ties."""
+    validated = _validate_candidates(candidates)
+
+    best_idx: int | None = None
+    best_score = -math.inf
+    for candidate in validated:
+        score = total_score(candidate["frame"], weights)
+        # A later candidate must only replace the incumbent on a strict,
+        # tolerance-aware improvement, so equal scores keep the first winner.
+        if best_idx is None or score > best_score + _TOL:
+            best_idx = candidate["idx"]
+            best_score = score
+    return int(best_idx)
 
 
 def pick_best(candidates: Sequence[Mapping[str, Any]]) -> int:
-    """Return the ``idx`` of the highest-scoring cover candidate.
-
-    Each candidate is a mapping with exactly the information needed here:
-    ``{"idx": <int>, "frame": <grayscale frame>}``.  Candidates are scored with
-    :func:`total_score` using :data:`DEFAULT_WEIGHTS`.
-
-    Contract
-    --------
-    * ``candidates`` must be a non-empty sequence of valid candidate mappings;
-      otherwise raise :class:`CoverError`.  In particular, an empty sequence
-      must raise :class:`CoverError`; it must never return ``-1`` or let the
-      caller index out of bounds.
-    * Return the integer ``idx`` of the candidate with the greatest total
-      score.
-    * The comparison is stable: when scores tie within ``1e-6``, the candidate
-      appearing earliest in ``candidates`` wins.  Do not replace the current
-      best merely because a later candidate has an equal score.
-
-    No mutation of the candidates is permitted.
-    """
-    raise NotImplementedError
+    """Return the ``idx`` of the highest-scoring cover candidate."""
+    return _select(candidates, DEFAULT_WEIGHTS)
 
 
 def cover_batch(
     videos: Sequence[Mapping[str, Any]],
     config: Mapping[str, Any],
 ) -> dict[str, int]:
-    """Select one cover candidate for every video in ``videos``.
+    """Select one cover candidate for every video in ``videos``."""
+    if isinstance(videos, (str, bytes, Mapping)) or not isinstance(
+        videos, Sequence
+    ):
+        raise CoverError("videos must be a sequence")
+    if not isinstance(config, Mapping):
+        raise CoverError("config must be a mapping")
 
-    Input shape
-    -----------
-    Each video is a mapping with:
+    allowed_config_keys = {"weights"}
+    for key in config:
+        if key not in allowed_config_keys:
+            raise CoverError(f"unknown config key: {key!r}")
 
-    * ``"id"``: a hashable, unique video identifier (normally a string);
-    * ``"candidates"``: a non-empty sequence of candidate mappings, each with
-      ``"idx"`` and ``"frame"`` as accepted by :func:`pick_best`.
+    weights = config.get("weights", DEFAULT_WEIGHTS)
+    # Validated up front so a zero-sum mapping fails before any video is
+    # processed and no partial result is ever produced.
+    validated_weights = _validate_weights(weights)
 
-    ``config`` is a mapping.  An optional ``"weights"`` entry supplies the
-    weights passed to :func:`total_score`; when absent,
-    :data:`DEFAULT_WEIGHTS` is used.  Unknown config keys raise
-    :class:`CoverError`.
+    seen_ids: set[Any] = set()
+    for video in videos:
+        if not isinstance(video, Mapping):
+            raise CoverError("each video must be a mapping")
+        if "id" not in video or "candidates" not in video:
+            raise CoverError("each video needs an 'id' and 'candidates'")
+        video_id = video["id"]
+        try:
+            hash(video_id)
+        except TypeError as exc:
+            raise CoverError("video 'id' must be hashable") from exc
+        if video_id in seen_ids:
+            raise CoverError(f"duplicate video id: {video_id!r}")
+        seen_ids.add(video_id)
+        # Validates the non-empty list and every frame before selection.
+        _validate_candidates(video["candidates"])
 
-    Contract
-    --------
-    * Validate all videos and the config before returning anything.  An empty
-      ``videos`` sequence is valid and returns ``{}``.
-    * Score every video's candidates independently.  Scores from one video
-      must never leak into another video's ranking; the result must equal
-      choosing the best candidate per video with that video's own scores and
-      the configured weights.
-    * Return a new ``dict`` mapping each video ``"id"`` to the selected
-      candidate's integer ``"idx"``.  Insertion order follows the input video
-      order, including when all videos succeed.
-    * Batch semantics are atomic: if any video is invalid, has an empty
-      candidate list, or cannot be scored, raise :class:`CoverError` and do
-      not return or retain a partial result.  The input sequences and mappings
-      must not be mutated.
-    * Ties within ``1e-6`` are broken in favour of the earlier candidate in
-      that video's candidate sequence, matching :func:`pick_best`.
-    """
-    raise NotImplementedError
+    # Each video gets a fresh selection pass; no score state is shared between
+    # videos, so rankings cannot leak across the batch.
+    result: dict[Any, int] = {}
+    for video in videos:
+        result[video["id"]] = _select(video["candidates"], validated_weights)
+    return result
